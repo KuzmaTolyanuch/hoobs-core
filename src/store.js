@@ -174,9 +174,9 @@ export default new Vuex.Store({
                 case "status":
                     state.version = payload.data.version;
                     state.running = payload.data.running;
-        
+
                     let diff = payload.data.uptime;
-        
+
                     state.uptime.days = Math.floor(diff / (1000 * 60 * 60 * 24));
                     diff -=  state.uptime.days * (1000 * 60 * 60 * 24);
                     state.uptime.hours = Math.floor(diff / (1000 * 60 * 60));

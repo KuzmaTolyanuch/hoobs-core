@@ -18,18 +18,18 @@
  **************************************************************************************************/
 
 const HBS = require("../server/instance");
-const HAP = require("hap-nodejs");
+const { HAPStorage } = require("hap-nodejs");
 const File = require("fs-extra");
-const User = require("./user");
+const { User } = require("homebridge/lib/user");
 const Server = require("./server");
-const Plugin = require("./plugin");
 const Program = require("commander");
 
 const { dirname, join } = require("path");
 const { internal } = require("./logger");
 
 module.exports = () => {
-    let removeOrphans = false
+    let keepOrphanedCachedAccessories = false
+    let customPluginPath = null;
     let terminating = false;
 
     HBS.application = HBS.JSON.load(join(dirname(File.realpathSync(__filename)), "../package.json"));
@@ -37,15 +37,18 @@ module.exports = () => {
     Program.version(HBS.application.version)
         .allowUnknownOption()
         .option("-d, --debug", "turn on debug level logging", function () { require("./logger").setDebug(true); })
-        .option("-p, --plugin-path [path]", "look for plugins installed at [path] as well as the default locations ([path] can also point to a single plugin)", function (p) { Plugin.addPluginPath(p); })
-        .option("-r, --remove-orphans", "remove cached accessories for which plugin is not loaded", function () { removeOrphans = true; })
+        .option("-p, --plugin-path [path]", "look for plugins installed at [path] as well as the default locations ([path] can also point to a single plugin)", function (p) { customPluginPath = p; })
+        .option("-r, --remove-orphans", "remove cached accessories for which plugin is not loaded", function () { keepOrphanedCachedAccessories = true; })
         .option("-u, --user-storage-path [path]", "look for bridge user files at [path]", function (p) { User.setStoragePath(p); })
         .parse(process.argv);
 
-    HAP.init(User.persistPath());
+    HAPStorage.setCustomStoragePath(User.persistPath());
 
     const server = new Server({
-        removeOrphans
+        keepOrphanedCachedAccessories,
+        insecureAccess: true,
+        hideQRCode: true,
+        customPluginPath
     });
 
     const signals = {
@@ -81,5 +84,11 @@ module.exports = () => {
         }
     });
 
-    server.run();
+    server.start().catch((error) => {
+        internal.error(error.stack);
+
+        if (!terminating) {
+            process.kill(process.pid, "SIGTERM");
+        }
+    });
 }

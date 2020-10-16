@@ -17,399 +17,435 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.                          *
  **************************************************************************************************/
 
-const API = require("./api");
-const User = require("./user");
-const Crypto = require("crypto");
-const Plugin = require("./plugin");
-const Manager = require("./manager");
-const Platform = require("./platform");
+const fs = require("fs");
+const os = require("os");
+const { join } = require("path");
+const storage = require("node-persist");
 
-const { once } = require("hap-nodejs/dist/lib/util/once");
-const { Logger, internal } = require("./logger");
-const { existsSync, readFileSync, writeFileSync } = require("fs-extra");
-const { uuid, Bridge, Accessory, Service, Characteristic, AccessoryLoader } = require("hap-nodejs");
+const {
+    Accessory,
+    AccessoryEventTypes,
+    AccessoryLoader,
+    Bridge,
+    Categories,
+    Characteristic,
+    CharacteristicEventTypes,
+    once,
+    Service,
+    uuid,
+} = require("hap-nodejs");
 
-const persist = require("node-persist").create();
+const { Console, internal } = require("./logger");
+const { Logger } = require("homebridge/lib/logger");
+
+Logger.internal = internal;
+
+const {
+    HomebridgeAPI,
+    InternalAPIEvent,
+} = require("homebridge/lib/api");
+
+const { PlatformAccessory } = require("homebridge/lib/platformAccessory");
+const mac = require("homebridge/lib/util/mac");
+const { PluginManager } = require("homebridge/lib/pluginManager");
+const HBS = require("../server/instance");
+
+PluginManager.PLUGIN_IDENTIFIER_PATTERN = /^((@[\S]*)\/)?([\S-]*)$/;
+
+const home = HBS.docker ? "/hoobs" : join(os.userInfo().homedir, ".hoobs");
+const accessoryStorage = storage.create();
+const log = internal;
 
 module.exports = class Server {
-    constructor(opts) {
-        opts = opts || {};
+    constructor(options = {}) {
+        accessoryStorage.initSync({ dir: join(home, "etc", HBS.name || "", "accessories") });
 
-        persist.initSync({ dir: User.cachedAccessoryPath() });
-
-        this.api = new API();
-
-        this.api.on("registerPlatformAccessories", (accessories) => {
-            this.handleRegisterPlatformAccessories(accessories);
-        });
-
-        this.api.on("updatePlatformAccessories", (accessories) => {
-            this.handleUpdatePlatformAccessories(accessories);
-        });
-
-        this.api.on("unregisterPlatformAccessories", (accessories) => {
-            this.handleUnregisterPlatformAccessories(accessories);
-        });
-
-        this.api.on("publishExternalAccessories", (accessories) => {
-            this.handlePublishExternalAccessories(accessories);
-        });
-
-        this.config = opts.config || this.loadConfig();
-        this.plugins = this.loadPlugins();
-        this.cachedPlatformAccessories = this.loadCachedPlatformAccessories();
-        this.bridge = this.createBridge();
-        this.removeOrphans = opts.removeOrphans || false;
-
+        this.cachedPlatformAccessories = [];
+        this.cachedAccessoriesFileCreated = false;
+        this.publishedExternalAccessories = new Map();
+        this.config = options.config || Server._loadConfig();
+        this.keepOrphanedCachedAccessories = options.keepOrphanedCachedAccessories || false;
+        this.allowInsecureAccess = true;
         this.externalPorts = this.config.ports;
-        this.nextExternalPort = undefined;
 
-        this.activeDynamicPlugins = {};
-        this.configurablePlatformPlugins = {};
-        this.publishedAccessories = {};
-        this.setupManager = new Manager();
+        this.api = new HomebridgeAPI();
+        this.api.on(InternalAPIEvent.REGISTER_PLATFORM_ACCESSORIES, this.handleRegisterPlatformAccessories.bind(this));
+        this.api.on(InternalAPIEvent.UPDATE_PLATFORM_ACCESSORIES, this.handleUpdatePlatformAccessories.bind(this));
+        this.api.on(InternalAPIEvent.UNREGISTER_PLATFORM_ACCESSORIES, this.handleUnregisterPlatformAccessories.bind(this));
+        this.api.on(InternalAPIEvent.PUBLISH_EXTERNAL_ACCESSORIES, this.handlePublishExternalAccessories.bind(this));
 
-        this.setupManager.on("newConfig", () => {
-            this.handleNewConfig()
+        this.pluginManager = new PluginManager(this.api, {
+            activePlugins: this.config.plugins,
+            customPluginPath: options.customPluginPath,
         });
 
-        this.setupManager.on("requestCurrentConfig", (callback) => {
-            callback(this.config);
-        });
+        this.bridge = new Bridge(this.config.bridge.name, uuid.generate("HomeBridge"));
     }
 
-    run() {
-        this.asyncCalls = 0;
-        this.asyncWait = true;
+    async start() {
+        const promises = [];
 
-        if (this.config.platforms) {
-            this.loadPlatforms();
+        this.loadCachedPlatformAccessoriesFromDisk();
+        this.pluginManager.initializeInstalledPlugins();
+
+        if (this.config.platforms.length > 0) {
+            promises.push(...this.loadPlatforms());
         }
 
-        if (this.config.accessories) {
-            this.loadAccessories();
+        if (this.config.accessories.length > 0) {
+            this._loadAccessories();
         }
 
-        this.loadDynamicPlatforms();
-        this.configCachedPlatformAccessories();
-        this.setupManager.configurablePlatformPlugins = this.configurablePlatformPlugins;
-        this.bridge.addService(this.setupManager.service);
+        this.restoreCachedPlatformAccessories();
+        this.api.signalFinished();
 
-        this.asyncWait = false;
+        await Promise.all(promises).then(() => this.publishBridge());
+    }
 
-        if (this.asyncCalls == 0) {
-            this.publish();
+    publishBridge() {
+        const bridgeConfig = this.config.bridge;
+        const info = this.bridge.getService(Service.AccessoryInformation);
+
+        info.setCharacteristic(Characteristic.Manufacturer, bridgeConfig.manufacturer || "homebridge.io");
+        info.setCharacteristic(Characteristic.Model, bridgeConfig.model || "homebridge");
+        info.setCharacteristic(Characteristic.SerialNumber, bridgeConfig.username);
+        info.setCharacteristic(Characteristic.FirmwareRevision, "1.2.3");
+
+        this.bridge.on(AccessoryEventTypes.LISTENING, (port) => {
+            log.info("Bridge is running on port %s.", port);
+
+            process.send({ event: "setup_uri", data: this.bridge.setupURI() });
+            process.send({ event: "running" });
+        });
+
+        const publishInfo = {
+            username: bridgeConfig.username,
+            port: bridgeConfig.port,
+            pincode: bridgeConfig.pin,
+            category: Categories.BRIDGE,
+            mdns: this.config.mdns,
+        };
+
+        if (bridgeConfig.setupID && bridgeConfig.setupID.length === 4) {
+            publishInfo.setupID = bridgeConfig.setupID;
         }
 
-        this.api.emit("didFinishLaunching");
+        this.bridge.publish(publishInfo, this.allowInsecureAccess);
 
         process.send({ event: "api_launched" });
     }
 
-    publish() {
-        const bridgeConfig = this.config.bridge || {};
-        const info = this.bridge.getService(Service.AccessoryInformation);
+    static _loadConfig() {
+        const configPath = join(home, "etc", HBS.name || "", "config.json");
 
-        info.setCharacteristic(Characteristic.Manufacturer, bridgeConfig.manufacturer || "HOOBS");
-        info.setCharacteristic(Characteristic.Model, bridgeConfig.model || "HOOBS");
-        info.setCharacteristic(Characteristic.SerialNumber, bridgeConfig.username);
-        info.setCharacteristic(Characteristic.FirmwareRevision, require("../package.json").version);
-
-        this.bridge.on("listening", (port) => {
-            internal.info(`Bridge is running on port ${port}.`);
-        });
-
-        const publishInfo = {
-            username: bridgeConfig.username || "CC:22:3D:E3:CE:30",
-            port: bridgeConfig.port || 0,
-            pincode: bridgeConfig.pin || "031-45-154",
-            category: Accessory.Categories.BRIDGE,
-            mdns: this.config.mdns
+        const defaultBridge = {
+            name: "HOOBS",
+            username: "CC:22:3D:E3:CE:30",
+            pin: "031-45-154",
         };
 
-        if (bridgeConfig.setupID && bridgeConfig.setupID.length === 4) {
-            publishInfo["setupID"] = bridgeConfig.setupID;
-        }
+        if (!fs.existsSync(configPath)) {
+            log.warn("config.json (%s) not found.", configPath);
 
-        this.bridge.publish(publishInfo, true);
-        this.printSetupInfo();
-
-        process.send({ event: "running" });
-    }
-
-    loadPlugins() {
-        const plugins = {};
-        const activePlugins = this.computeActivePluginList();
-
-        let foundOnePlugin = false;
-
-        Plugin.installed().forEach((plugin) => {
-            if (activePlugins !== undefined && activePlugins[plugin.name()] !== true) {
-                return;
-            }
-
-            try {
-                plugin.load();
-            } catch (err) {
-                internal.error(`Error loading plugin "${plugin.name()}".`);
-                internal.error(err.stack);
-
-                plugin.loadError = err;
-            }
-
-            if (!plugin.loadError) {
-                plugins[plugin.name()] = plugin;
-
-                internal.info(`Loaded plugin "${plugin.name()}".`);
-
-                plugin.initializer(this.api);
-
-                foundOnePlugin = true;
-            }
-        });
-
-        if (!foundOnePlugin) {
-            internal.warn("No plugins found.");
-        }
-
-        return plugins;
-    }
-
-    loadConfig() {
-        const configPath = User.configPath();
-
-        if (!existsSync(configPath)) {
-            internal.warn(`config.json "${configPath}" not found.`);
-
-            return {
-                bridge: {
-                    name: "HOOBS",
-                    username: "CC:22:3D:E3:CE:30",
-                    pin: "031-45-154"
-                }
+            const defaultConfig = {
+                bridge: defaultBridge,
+                accessories: [],
+                platforms: [],
             };
+
+            fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 4));
+
+            return defaultConfig;
         }
 
         let config = {};
 
         try {
-            config = JSON.parse(readFileSync(configPath));
+            config = JSON.parse(fs.readFileSync(configPath, { encoding: "utf8" }));
         } catch (err) {
-            internal.error("There was a problem reading your config.json file.");
+            log.error("There was a problem reading your config.json file.");
+            log.error("");
 
-            return {
-                bridge: {
-                    name: "HOOBS",
-                    username: "CC:22:3D:E3:CE:30",
-                    pin: "031-45-154"
-                }
-            };
+            throw err;
         }
 
         if (config.ports !== undefined) {
-            if (config.ports.start > config.ports.end) {
-                internal.error("Invalid port pool configuration. End should be greater than or equal to start.");
-
+            if (config.ports.start && config.ports.end) {
+                if (config.ports.start > config.ports.end) {
+                    log.error("Invalid port pool configuration, end should be greater than or equal to start.");
+                    config.ports = undefined;
+                }
+            } else {
                 config.ports = undefined;
             }
         }
 
-        if (!/^([0-9A-F]{2}:){5}([0-9A-F]{2})$/.test(config.bridge.username)) {
-            internal.error(`Not a valid username: "${config.bridge.username}".`);
+        const bridge = config.bridge || defaultBridge;
 
-            config.bridge.username = "CC:22:3D:E3:CE:30";
+        bridge.name = bridge.name || defaultBridge.name;
+        bridge.username = bridge.username || defaultBridge.username;
+        bridge.pin = bridge.pin || defaultBridge.pin;
+
+        config.bridge = bridge;
+
+        const username = config.bridge.username;
+
+        if (!mac.validMacAddress(username)) {
+            throw new Error(`Not a valid username: ${username}. Must be 6 pairs of colon-separated hexadecimal chars (A-F 0-9), like a MAC address.`);
         }
+
+        config.accessories = config.accessories || [];
+        config.platforms = config.platforms || [];
+        log.info("Loaded config.json with %s accessories and %s platforms.", config.accessories.length, config.platforms.length);
+
+        log.info("---");
 
         return config;
     }
 
-    loadCachedPlatformAccessories() {
-        const cachedAccessories = persist.getItem("cachedAccessories");
-        const platformAccessories = [];
+    loadCachedPlatformAccessoriesFromDisk() {
+        const cachedAccessories = accessoryStorage.getItem("cachedAccessories");
 
         if (cachedAccessories) {
-            for (let index in cachedAccessories) {
-                platformAccessories.push(Platform.deserialize(cachedAccessories[index]));
-            }
-        }
+            this.cachedPlatformAccessories = cachedAccessories.map(serialized => {
+                return PlatformAccessory.deserialize(serialized);
+            });
 
-        return platformAccessories;
+            this.cachedAccessoriesFileCreated = true;
+        }
     }
 
-    computeActivePluginList() {
-        if (this.config.plugins === undefined) {
-            return undefined;
-        }
+    restoreCachedPlatformAccessories() {
+        this.cachedPlatformAccessories = (this.cachedPlatformAccessories || []).filter(accessory => {
+            let plugin = this.pluginManager.getPlugin(accessory._associatedPlugin);
 
-        const activePlugins = {};
+            if (!plugin) {
+                try {
+                    plugin = this.pluginManager.getPluginByActiveDynamicPlatform(accessory._associatedPlatform);
 
-        for (let i = 0; i < this.config.plugins.length; i++) {
-            activePlugins[this.config.plugins[i]] = true;
-        }
+                    if (plugin) {
+                        log.info("When searching for the associated plugin of the accessory '" + accessory.displayName + "' " +
+                            "it seems like the plugin name changed from '" + accessory._associatedPlugin + "' to '" +
+                            plugin.getPluginIdentifier() + "'. Plugin association is now being transformed!");
 
-        return activePlugins;
-    }
-
-    createBridge() {
-        return new Bridge((this.config.bridge || {}).name || "HOOBS", uuid.generate("HomeBridge"));
-    }
-
-    loadAccessories() {
-        for (let i = 0; i < this.config.accessories.length; i++) {
-            const init = this.api.accessory(this.config.accessories[i]["accessory"]);
-
-            if (!init) {
-                internal.warn(`Your config.json is requesting the accessory "${this.config.accessories[i]["accessory"]}" which has not been published by any installed plugins.`);
-            } else {
-                const logger = Logger.withPrefix(this.config.accessories[i]["name"]);
-                const instance = new init(logger, this.config.accessories[i], this.api);
-                const accessory = this.createAccessory(instance, this.config.accessories[i]["name"], this.config.accessories[i]["accessory"], this.config.accessories[i].uuid_base);
-
-                if (accessory) {
-                    this.bridge.addBridgedAccessory(accessory);
+                        accessory._associatedPlugin = plugin.getPluginIdentifier();
+                    }
+                } catch (error) {
+                    log.info("Could not find the associated plugin for the accessory '" + accessory.displayName + "'. " +
+                        "Tried to find the plugin by the platform name but " + error.message);
                 }
             }
+
+            const platformPlugins = plugin && plugin.getActiveDynamicPlatform(accessory._associatedPlatform);
+
+            if (!platformPlugins) {
+                log.info(`Failed to find plugin to handle accessory ${accessory._associatedHAPAccessory.displayName}`);
+
+                if (!this.keepOrphanedCachedAccessories) {
+                    log.info(`Removing orphaned accessory ${accessory._associatedHAPAccessory.displayName}`);
+                    return false;
+                }
+            } else {
+                const service = accessory.getService(Service.AccessoryInformation);
+
+                if (service) {
+                    service.setCharacteristic(Characteristic.FirmwareRevision, plugin.version);
+                }
+
+                platformPlugins.configureAccessory(accessory);
+            }
+
+            this.bridge.addBridgedAccessory(accessory._associatedHAPAccessory);
+
+            return true;
+        });
+    }
+
+    saveCachedPlatformAccessoriesOnDisk() {
+        if ((this.cachedPlatformAccessories || []).length > 0) {
+            this.cachedAccessoriesFileCreated = true;
+
+            const serializedAccessories = this.cachedPlatformAccessories.map(accessory => PlatformAccessory.serialize(accessory));
+
+            accessoryStorage.setItemSync("cachedAccessories", serializedAccessories);
+        } else if (this.cachedAccessoriesFileCreated) {
+            this.cachedAccessoriesFileCreated = false;
+
+            accessoryStorage.removeItemSync("cachedAccessories");
         }
+    }
+
+    _loadAccessories() {
+        log.info("Loading " + this.config.accessories.length + " accessories...");
+
+        this.config.accessories.forEach((accessoryConfig, index) => {
+            if (!accessoryConfig.accessory) {
+                log.warn("Your config.json contains an illegal accessory configuration object at position %d. " +
+                    "Missing property 'accessory'. Skipping entry...", index + 1);
+                return;
+            }
+
+            const accessoryIdentifier = accessoryConfig.accessory;
+            const displayName = accessoryConfig.name;
+
+            if (!displayName) {
+                log.warn("Could not load accessory %s at position %d as it is missing the required 'name' property!", accessoryIdentifier, index + 1);
+                return;
+            }
+
+            let plugin;
+            let constructor;
+
+            try {
+                plugin = this.pluginManager.getPluginForAccessory(accessoryIdentifier);
+                constructor = plugin.getAccessoryConstructor(accessoryIdentifier);
+            } catch (error) {
+                log.warn("Error loading accessory requested in your config.json at position %d", index + 1);
+
+                throw error;
+            }
+
+            const logger = Console.withPrefix(displayName);
+
+            logger("Initializing %s accessory...", accessoryIdentifier);
+
+            const accessoryInstance = new constructor(logger, accessoryConfig, this.api);
+            const accessory = this.createHAPAccessory(plugin, accessoryInstance, displayName, accessoryIdentifier, accessoryConfig.uuid_base);
+
+            if (accessory) {
+                this.bridge.addBridgedAccessory(accessory);
+            } else {
+                logger("Accessory %s returned empty set of services. Won't adding it to the bridge!", accessoryIdentifier);
+            }
+        });
     }
 
     loadPlatforms() {
-        for (let i = 0; i < this.config.platforms.length; i++) {
-            const init = this.api.platform(this.config.platforms[i].platform);
+        log.info("Loading " + this.config.platforms.length + " platforms...");
 
-            if (!init) {
-                internal.warn(`Your config.json is requesting the platform "${this.config.platforms[i].platform}" which has not been published by any installed plugins.`);
-            } else {
-                const logger = Logger.withPrefix(this.config.platforms[i].name || this.config.platforms[i].platform);
-                const instance = new init(logger, this.config.platforms[i], this.api);
+        const promises = [];
 
-                if (instance.configureAccessory == undefined) {
-                    this.loadPlatformAccessories(instance, logger, this.config.platforms[i].platform);
-                } else {
-                    this.activeDynamicPlugins[this.config.platforms[i].platform] = instance;
-                }
-
-                if (instance.configurationRequestHandler != undefined) {
-                    this.configurablePlatformPlugins[this.config.platforms[i].platform] = instance;
-                }
+        this.config.platforms.forEach((platformConfig, index) => {
+            if (!platformConfig.platform) {
+                log.warn("Your config.json contains an illegal platform configuration object at position %d. " +
+                    "Missing property 'platform'. Skipping entry...", index + 1);
+                return;
             }
+
+            const platformIdentifier = platformConfig.platform;
+            const displayName = platformConfig.name || platformIdentifier;
+
+            let plugin;
+            let constructor;
+
+            try {
+                plugin = this.pluginManager.getPluginForPlatform(platformIdentifier);
+                constructor = plugin.getPlatformConstructor(platformIdentifier);
+            } catch (error) {
+                log.warn("Error loading platform requested in your config.json at position %d", index + 1);
+
+                throw error;
+            }
+
+            const logger = Console.withPrefix(displayName);
+
+            logger("Initializing %s platform...", platformIdentifier);
+
+            const platform = new constructor(logger, platformConfig, this.api);
+
+            if (HomebridgeAPI.isDynamicPlatformPlugin(platform)) {
+                plugin.assignDynamicPlatform(platformIdentifier, platform);
+            } else if (HomebridgeAPI.isStaticPlatformPlugin(platform)) {
+                promises.push(this.loadPlatformAccessories(plugin, platform, platformIdentifier, logger));
+            }
+        });
+
+        return promises;
+    }
+
+    async loadPlatformAccessories(plugin, platformInstance, platformType, logger) {
+        return new Promise(resolve => {
+            platformInstance.accessories(once((accessories) => {
+                accessories.forEach((accessoryInstance, index) => {
+                    const accessoryName = accessoryInstance.name;
+                    const uuidBase = accessoryInstance.uuid_base;
+
+                    log.info("Initializing platform accessory '%s'...", accessoryName);
+
+                    const accessory = this.createHAPAccessory(plugin, accessoryInstance, accessoryName, platformType, uuidBase);
+
+                    if (accessory) {
+                        this.bridge.addBridgedAccessory(accessory);
+                    } else {
+                        logger("Platform %s returned an accessory at index %d with an empty set of services. Won't adding it to the bridge!", platformType, index);
+                    }
+                });
+
+                resolve();
+            }));
+        });
+    }
+
+    createHAPAccessory(plugin, accessoryInstance, displayName, accessoryType, uuidBase) {
+        const services = (accessoryInstance.getServices() || [])
+            .filter(service => !!service);
+
+        const controllers = (accessoryInstance.getControllers && accessoryInstance.getControllers() || [])
+            .filter(controller => !!controller);
+
+        if (services.length === 0 && controllers.length === 0) {
+            return undefined;
         }
-    }
-
-    loadDynamicPlatforms() {
-        for (let dynamicPluginName in this.api.dynamicPlatforms) {
-            if (!this.activeDynamicPlugins[dynamicPluginName] && !this.activeDynamicPlugins[dynamicPluginName.split(".")[1]]) {
-                process.send({ event: "info_log", data: `Load ${dynamicPluginName}` });
-
-                const init = this.api.dynamicPlatforms[dynamicPluginName];
-                const logger = Logger.withPrefix(dynamicPluginName);
-                const instance = new init(logger, null, this.api);
-
-                this.activeDynamicPlugins[dynamicPluginName] = instance;
-
-                if (instance.configurationRequestHandler != undefined) {
-                    this.configurablePlatformPlugins[dynamicPluginName] = instance;
-                }
-            }
-        }
-    }
-
-    configCachedPlatformAccessories() {
-        const verifiedAccessories = [];
-
-        for (let index in this.cachedPlatformAccessories) {
-            const accessory = this.cachedPlatformAccessories[index];
-
-            if (!(accessory instanceof Platform)) {
-                process.send({ event: "error_log", data: "Unexpected Accessory" });
-
-                continue;
-            }
-
-            let instance = this.activeDynamicPlugins[accessory.associatedPlugin + "." + accessory.associatedPlatform];
-
-            if (!instance) {
-                instance = this.activeDynamicPlugins[accessory.associatedPlatform];
-            }
-
-            if (instance) {
-                instance.configureAccessory(accessory);
-            } else {
-                process.send({ event: "error_log", data: `Failed to find plugin to handle accessory ${accessory.displayName}` });
-
-                if (this.removeOrphans) {
-                    process.send({ event: "info_log", data: `Removing orphaned accessory ${accessory.displayName}` });
-
-                    continue;
-                }
-            }
-
-            verifiedAccessories.push(accessory);
-
-            this.bridge.addBridgedAccessory(accessory.associated);
-        }
-
-        this.cachedPlatformAccessories = verifiedAccessories;
-    }
-
-    loadPlatformAccessories(instance, internal, platformType) {
-        this.asyncCalls++;
-
-        instance.accessories(once((foundAccessories) => {
-            this.asyncCalls--;
-
-            for (let i = 0; i < foundAccessories.length; i++) {
-                const accessoryInstance = foundAccessories[i];
-
-                internal(`Initializing platform accessory "${accessoryInstance.name}"...`);
-
-                this.bridge.addBridgedAccessory(this.createAccessory(accessoryInstance, accessoryInstance.name, platformType, accessoryInstance.uuid_base));
-            }
-
-            if (this.asyncCalls === 0 && !this.asyncWait) {
-                this.publish();
-            }
-        }));
-    }
-
-    createAccessory(accessoryInstance, displayName, accessoryType, uuidBase) {
-        const services = accessoryInstance.getServices();
 
         if (!(services[0] instanceof Service)) {
             return AccessoryLoader.parseAccessoryJSON({
-                displayName,
-                services
+                displayName: displayName,
+                services: services,
             });
         } else {
-            const accessory = new Accessory(displayName, uuid.generate(accessoryType + ":" + (uuidBase || displayName)));
+            const accessoryUUID = uuid.generate(accessoryType + ":" + (uuidBase || displayName));
+            const accessory = new Accessory(displayName, accessoryUUID);
 
             accessory.on("service-characteristic-change", (data) => {
                 if (
                     data.newValue !== data.oldValue
-                 && data.characteristic.displayName !== "Last Updated"
-                 && data.characteristic.displayName !== "Serial Number"
-                 && data.characteristic.displayName !== "Manufacturer"
-                 && data.characteristic.displayName !== "Identify"
-                 && data.characteristic.displayName !== "Model"
+                    && data.characteristic.displayName !== "Last Updated"
+                    && data.characteristic.displayName !== "Serial Number"
+                    && data.characteristic.displayName !== "Manufacturer"
+                    && data.characteristic.displayName !== "Identify"
+                    && data.characteristic.displayName !== "Model"
                 ) {
                     process.send({ event: "accessory_change" });
                 }
             });
 
             if (accessoryInstance.identify) {
-                accessory.on("identify", (_paired, callback) => {
-                    accessoryInstance.identify(callback);
+                accessory.on(AccessoryEventTypes.IDENTIFY, (paired, callback) => {
+                    accessoryInstance.identify(() => { });
+
+                    callback();
                 });
             }
 
             const informationService = accessory.getService(Service.AccessoryInformation);
 
-            services.forEach((service) => {
+            services.forEach(service => {
                 if (service instanceof Service.AccessoryInformation) {
                     service.setCharacteristic(Characteristic.Name, displayName);
+                    service.getCharacteristic(Characteristic.Identify).removeAllListeners(CharacteristicEventTypes.SET);
+
                     informationService.replaceCharacteristicsFromService(service);
                 } else {
                     accessory.addService(service);
                 }
+            });
+
+            if (informationService.getCharacteristic(Characteristic.FirmwareRevision).value === "0.0.0") {
+                informationService.setCharacteristic(Characteristic.FirmwareRevision, plugin.version);
+            }
+
+            controllers.forEach(controller => {
+                accessory.configureController(controller);
             });
 
             return accessory;
@@ -417,213 +453,114 @@ module.exports = class Server {
     }
 
     handleRegisterPlatformAccessories(accessories) {
-        const hapAccessories = [];
-
-        for (let index in accessories) {
-            const accessory = accessories[index];
-
-            hapAccessories.push(accessory.associated);
-
+        const hapAccessories = accessories.map(accessory => {
             this.cachedPlatformAccessories.push(accessory);
-        }
+
+            const plugin = this.pluginManager.getPlugin(accessory._associatedPlugin);
+
+            if (plugin) {
+                const informationService = accessory.getService(Service.AccessoryInformation);
+
+                if (informationService && informationService.getCharacteristic(Characteristic.FirmwareRevision).value === "0.0.0") {
+                    informationService.setCharacteristic(Characteristic.FirmwareRevision, plugin.version);
+                }
+
+                const platforms = plugin.getActiveDynamicPlatform(accessory._associatedPlatform);
+
+                if (!platforms) {
+                    log.warn("The plugin '%s' registered a new accessory for the platform '%s'. The platform couldn't be found though!", accessory._associatedPlugin, accessory._associatedPlatform);
+                }
+            } else {
+                log.warn("A platform configured a new accessory under the plugin name '%s'. However no loaded plugin could be found for the name!", accessory._associatedPlugin);
+            }
+
+            return accessory._associatedHAPAccessory;
+        });
 
         this.bridge.addBridgedAccessories(hapAccessories);
-        this.updateCachedAccessories();
+        this.saveCachedPlatformAccessoriesOnDisk();
     }
 
-    handleUpdatePlatformAccessories() {
-        this.updateCachedAccessories();
+    handleUpdatePlatformAccessories(accessories) {
+        this.saveCachedPlatformAccessoriesOnDisk();
     }
 
     handleUnregisterPlatformAccessories(accessories) {
-        const hapAccessories = [];
-
-        for (let index in accessories) {
-            const accessory = accessories[index];
-
-            if (accessory.associated) {
-                hapAccessories.push(accessory.associated);
+        const hapAccessories = accessories.map(accessory => {
+            const index = this.cachedPlatformAccessories.indexOf(accessory);
+            if (index >= 0) {
+                this.cachedPlatformAccessories.splice(index, 1);
             }
 
-            for (let targetIndex in this.cachedPlatformAccessories) {
-                if (this.cachedPlatformAccessories[targetIndex].UUID === accessory.UUID) {
-                    this.cachedPlatformAccessories.splice(targetIndex, 1);
-
-                    break;
-                }
-            }
-        }
+            return accessory._associatedHAPAccessory;
+        });
 
         this.bridge.removeBridgedAccessories(hapAccessories);
-        this.updateCachedAccessories();
+        this.saveCachedPlatformAccessoriesOnDisk();
     }
 
     handlePublishExternalAccessories(accessories) {
-        for (let index in accessories) {
-            const accessory = accessories[index];
+        const accessoryPin = this.config.bridge.pin;
 
+        accessories.forEach(accessory => {
             let accessoryPort = 0;
 
             if (this.externalPorts) {
-                if (this.nextExternalPort > this.externalPorts.end) {
-                    internal.info("External port pool ran out of ports. Fallback to random assign.");
+                if (this.nextExternalPort === undefined) {
+                    this.nextExternalPort = this.externalPorts.start;
+                }
 
-                    accessoryPort = 0;
+                if (this.nextExternalPort <= this.externalPorts.end) {
+                    accessoryPort = this.nextExternalPort++;
                 } else {
-                    if (this.nextExternalPort !== undefined) {
-                        accessoryPort = this.nextExternalPort;
-
-                        this.nextExternalPort += 1;
-                    } else {
-                        accessoryPort = this.externalPorts.start;
-
-                        this.nextExternalPort = this.externalPorts.start + 1;
-                    }
+                    log.warn("External port pool ran out of ports. Fallback to random assign.");
                 }
             }
 
-            const hapAccessory = accessory.associated;
-            const advertiseAddress = this.generateAddress(accessory.UUID);
+            const hapAccessory = accessory._associatedHAPAccessory;
+            const advertiseAddress = mac.generate(hapAccessory.UUID);
 
-            if (this.publishedAccessories[advertiseAddress]) {
-                internal.warn(`Accessory ${accessory.displayName}experienced an address collision.`);
+            if (this.publishedExternalAccessories.has(advertiseAddress)) {
+                throw new Error(`Accessory ${hapAccessory.displayName} experienced an address collision.`);
             } else {
-                this.publishedAccessories[advertiseAddress] = accessory;
-
-                ((name) => {
-                    hapAccessory.on("listening", (port) => {
-                        internal.info(`${name} is running on port ${port}.`);
-                    });
-                })(accessory.displayName);
-
-                hapAccessory.publish({
-                    username: advertiseAddress,
-                    pincode: (this.config.bridge || {}).pin || "031-45-154",
-                    category: accessory.category,
-                    port: accessoryPort,
-                    mdns: this.config.mdns
-                }, true);
+                this.publishedExternalAccessories.set(advertiseAddress, accessory);
             }
-        }
-    }
 
-    updateCachedAccessories() {
-        const serializedAccessories = [];
+            const plugin = this.pluginManager.getPlugin(accessory._associatedPlugin);
 
-        for (let index in this.cachedPlatformAccessories) {
-            serializedAccessories.push(Platform.serialize(this.cachedPlatformAccessories[index]));
-        }
+            if (plugin) {
+                const informationService = hapAccessory.getService(Service.AccessoryInformation);
 
-        persist.setItemSync("cachedAccessories", serializedAccessories);
-    }
+                if (informationService && informationService.getCharacteristic(Characteristic.FirmwareRevision).value === "0.0.0") {
+                    informationService.setCharacteristic(Characteristic.FirmwareRevision, plugin.version);
+                }
+            } else if (PluginManager.isQualifiedPluginIdentifier(accessory._associatedPlugin)) {
+                log.warn("A platform configured a external accessory under the plugin name '%s'. However no loaded plugin could be found for the name!", accessory._associatedPlugin);
+            }
 
-    generateAddress(data) {
-        const sha1sum = Crypto.createHash("sha1");
+            hapAccessory.on(AccessoryEventTypes.LISTENING, (port) => {
+                log.info("%s is running on port %s.", hapAccessory.displayName, port);
+                log.info("Please add [%s] manually in Home app. Setup Code: %s", hapAccessory.displayName, accessoryPin);
+            });
 
-        sha1sum.update(data);
-
-        let s = sha1sum.digest("hex");
-        let i = -1;
-
-        return "xx:xx:xx:xx:xx:xx".replace(/[x]/g, function () {
-            i += 1;
-
-            return s[i];
-        }).toUpperCase();
-    }
-
-    teardown() {
-        this.updateCachedAccessories();
-        this.bridge.unpublish();
-
-        Object.keys(this.publishedAccessories).forEach((advertiseAddress) => {
-            this.publishedAccessories[advertiseAddress].associated.unpublish();
+            hapAccessory.publish({
+                username: advertiseAddress,
+                pincode: accessoryPin,
+                category: accessory.category,
+                port: accessoryPort,
+                mdns: this.config.mdns,
+            }, this.allowInsecureAccess);
         });
     }
 
-    handleNewConfig(type, name, replace, config) {
-        if (type === "accessory") {
-            if (!this.config.accessories) {
-                this.config.accessories = [];
-            }
+    teardown() {
+        this.saveCachedPlatformAccessoriesOnDisk();
+        this.bridge.unpublish();
 
-            if (!replace) {
-                this.config.accessories.push(config);
-            } else {
-                let targetName;
-
-                if (name.indexOf(".") !== -1) {
-                    targetName = name.split(".")[1];
-                }
-
-                let found = false;
-
-                for (let index in this.config.accessories) {
-                    if (this.config.accessories[index].accessory === name) {
-                        this.config.accessories[index] = config;
-
-                        found = true;
-
-                        break;
-                    }
-
-                    if (targetName && (this.config.accessories[index].accessory === targetName)) {
-                        this.config.accessories[index] = config;
-
-                        found = true;
-
-                        break;
-                    }
-                }
-
-                if (!found) {
-                    this.config.accessories.push(config);
-                }
-            }
-        } else if (type === "platform") {
-            if (!this.config.platforms) {
-                this.config.platforms = [];
-            }
-
-            if (!replace) {
-                this.config.platforms.push(config);
-            } else {
-                let targetName;
-
-                if (name.indexOf(".") !== -1) {
-                    targetName = name.split(".")[1];
-                }
-
-                let found = false;
-
-                for (let index in this.config.platforms) {
-                    if (this.config.platforms[index].platform === name) {
-                        this.config.platforms[index] = config;
-
-                        found = true;
-
-                        break;
-                    }
-
-                    if (targetName && (this.config.platforms[index].platform === targetName)) {
-                        this.config.platforms[index] = config;
-
-                        found = true;
-
-                        break;
-                    }
-                }
-
-                if (!found) {
-                    this.config.platforms.push(config);
-                }
-            }
+        for (const accessory of this.publishedExternalAccessories.values()) {
+            accessory._associatedHAPAccessory.unpublish();
         }
 
-        writeFileSync(User.configPath(), JSON.stringify(this.config, null, 4), "utf8");
-    }
-
-    printSetupInfo() {
-        process.send({ event: "setup_uri", data: this.bridge.setupURI() });
+        this.api.signalShutdown();
     }
 }

@@ -27,7 +27,7 @@ function setDebug(enabled) {
 
 const loggerCache = {};
 
-class Logger {
+class Console {
     constructor(prefix) {
         this.prefix = prefix;
     }
@@ -66,7 +66,7 @@ class Logger {
     
     static withPrefix(prefix) {
         if (!loggerCache[prefix]) {
-            const logger = new Logger(prefix);
+            const logger = new Console(prefix);
             const log = logger.info.bind(logger);
     
             log.debug = logger.debug;
@@ -84,7 +84,7 @@ class Logger {
 }
 
 module.exports = {
-    Logger,
+    Console,
     setDebug,
-    internal: new Logger()
+    internal: new Console()
 }
