@@ -166,8 +166,8 @@ module.exports = class Server {
         const bridgeConfig = this.config.bridge;
         const info = this.bridge.getService(Service.AccessoryInformation);
 
-        info.setCharacteristic(Characteristic.Manufacturer, bridgeConfig.manufacturer || "homebridge.io");
-        info.setCharacteristic(Characteristic.Model, bridgeConfig.model || "homebridge");
+        info.setCharacteristic(Characteristic.Manufacturer, bridgeConfig.manufacturer || "HOOBS");
+        info.setCharacteristic(Characteristic.Model, bridgeConfig.model || "HOOBS");
         info.setCharacteristic(Characteristic.SerialNumber, bridgeConfig.username);
         info.setCharacteristic(Characteristic.FirmwareRevision, "1.2.3");
 
