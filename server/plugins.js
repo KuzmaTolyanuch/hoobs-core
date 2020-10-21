@@ -22,7 +22,7 @@ const Request = require("axios");
 const HBS = require("./instance");
 const Server = require("./server");
 
-const { join } = require("path");
+const { join, dirname } = require("path");
 const { spawn } = require("child_process");
 
 const blocked = [
@@ -40,9 +40,15 @@ module.exports = class Plugins {
     static list() {
         const results = {};
         const modules = [];
-
         const plugins = HBS.config.plugins || [];
-        const dependencies = Object.keys(HBS.application.dependencies);
+
+        let dependencies = [];
+        
+        try {
+            dependencies = Object.keys(HBS.JSON.load(join(Server.paths.application, "package.json"), {}).dependencies);
+        } catch (_error) {
+            dependencies = [];
+        }
 
         for (let i = 0; i < plugins.length; i++) {
             let plugin = null;
@@ -63,8 +69,6 @@ module.exports = class Plugins {
         for (let i = 0; i < modules.length; i++) {
             const directory = join(Server.paths.modules.local, modules[i]);
             const filename = join(directory, "/package.json");
-
-            HBS.log.debug(directory);
 
             if (File.existsSync(filename)) {
                 const item = HBS.JSON.load(filename, {});
@@ -117,6 +121,7 @@ module.exports = class Plugins {
                         directory: directory,
                         description: (item.description || "").replace(/(?:https?|ftp):\/\/[\n\S]+/g, "").trim(),
                         keywords: item.keywords || [],
+                        library: dirname(item.main || "./index.js"),
                         schema: {
                             platform: {
                                 plugin_alias: schema.platform.plugin_alias || schema.platform.pluginAlias,

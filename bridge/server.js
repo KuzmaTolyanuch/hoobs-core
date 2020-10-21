@@ -17,6 +17,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.                          *
  **************************************************************************************************/
 
+const _ = require("lodash");
+
 const fs = require("fs");
 const os = require("os");
 const { join } = require("path");
@@ -36,6 +38,7 @@ const {
 } = require("hap-nodejs");
 
 const { Console, internal } = require("./logger");
+const { Plugin } = require("homebridge/lib/plugin");
 const { Logger } = require("homebridge/lib/logger");
 
 Logger.internal = internal;
@@ -49,6 +52,7 @@ const { PlatformAccessory } = require("homebridge/lib/platformAccessory");
 const mac = require("homebridge/lib/util/mac");
 const { PluginManager } = require("homebridge/lib/pluginManager");
 const HBS = require("../server/instance");
+const Plugins = require("../server/plugins");
 
 PluginManager.PLUGIN_IDENTIFIER_PATTERN = /^((@[\S]*)\/)?([\S-]*)$/;
 
@@ -86,7 +90,63 @@ module.exports = class Server {
         const promises = [];
 
         this.loadCachedPlatformAccessoriesFromDisk();
-        this.pluginManager.initializeInstalledPlugins();
+
+        const installed = Plugins.list();
+        const keys = Object.keys(installed);
+
+        for (let i = 0; i < keys.length; i += 1) {
+            const { ...item } = installed[keys[i]];
+            const filename = join(item.directory, "package.json");
+            const identifier = item.scope ? `@${item.scope}/${item.name}` : item.name;
+
+            if (fs.existsSync(filename) && fs.existsSync(join(item.directory, item.library, "index.js"))) {
+                let pjson = null;
+
+                try {
+                    pjson = JSON.parse(fs.readFileSync(filename).toString());
+                } catch (error) {
+                    pjson = null;
+
+                    log.error(error.message);
+                }
+
+                if (pjson && !this.pluginManager.plugins.get(identifier)) {
+                    const plugin = new Plugin(item.name, item.directory, pjson, item.scope);
+
+                    this.pluginManager.plugins.set(identifier, plugin);
+
+                    try {
+                        plugin.load();
+                    } catch (error) {
+                        log.error(`Error loading plugin "${identifier}"`);
+                        log.error(error.stack);
+
+                        this.pluginManager.plugins.delete(identifier);
+                    }
+
+                    log.info(`Loaded plugin '${identifier}'`);
+
+                    if (this.pluginManager.plugins.get(identifier)) {
+                        try {
+                            this.pluginManager.currentInitializingPlugin = plugin;
+
+                            plugin.initialize(this.api);
+                        } catch (error) {
+                            log.error(`Error initializing plugin '${identifier}'`);
+                            log.error(error.stack);
+
+                            this.pluginManager.plugins.delete(identifier);
+                        }
+                    }
+                }
+            }
+        }
+
+        this.pluginManager.currentInitializingPlugin = undefined;
+
+        if (this.pluginManager.plugins.size === 0) {
+            log.warn("No plugins installed.");
+        }
 
         if (this.config.platforms.length > 0) {
             promises.push(...this.loadPlatforms());
@@ -136,71 +196,34 @@ module.exports = class Server {
     }
 
     static _loadConfig() {
-        const configPath = join(home, "etc", HBS.name || "", "config.json");
+        const current = _.extend({
+            server: {},
+            client: {},
+            bridge: {},
+            description: "",
+            ports: {},
+            plugins: [],
+            accessories: [],
+            platforms: []
+        }, HBS.JSON.load(join(home, "etc", HBS.name || "", "config.json"), {}));
 
-        const defaultBridge = {
-            name: "HOOBS",
-            username: "CC:22:3D:E3:CE:30",
-            pin: "031-45-154",
-        };
-
-        if (!fs.existsSync(configPath)) {
-            log.warn("config.json (%s) not found.", configPath);
-
-            const defaultConfig = {
-                bridge: defaultBridge,
-                accessories: [],
-                platforms: [],
-            };
-
-            fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 4));
-
-            return defaultConfig;
+        if (!current.server.port) {
+            current.server.port = 80;
         }
 
-        let config = {};
-
-        try {
-            config = JSON.parse(fs.readFileSync(configPath, { encoding: "utf8" }));
-        } catch (err) {
-            log.error("There was a problem reading your config.json file.");
-            log.error("");
-
-            throw err;
+        if (!current.server.origin) {
+            current.server.origin = "*";
         }
 
-        if (config.ports !== undefined) {
-            if (config.ports.start && config.ports.end) {
-                if (config.ports.start > config.ports.end) {
-                    log.error("Invalid port pool configuration, end should be greater than or equal to start.");
-                    config.ports = undefined;
-                }
-            } else {
-                config.ports = undefined;
-            }
+        if (current.package_manager && current.package_manager === "yarn") {
+            current.package_manager = File.existsSync("/usr/local/bin/yarn") || File.existsSync("/usr/bin/yarn") ? "yarn" : "npm"
+        } else {
+            current.package_manager = "npm";
         }
 
-        const bridge = config.bridge || defaultBridge;
+        HBS.config = current;
 
-        bridge.name = bridge.name || defaultBridge.name;
-        bridge.username = bridge.username || defaultBridge.username;
-        bridge.pin = bridge.pin || defaultBridge.pin;
-
-        config.bridge = bridge;
-
-        const username = config.bridge.username;
-
-        if (!mac.validMacAddress(username)) {
-            throw new Error(`Not a valid username: ${username}. Must be 6 pairs of colon-separated hexadecimal chars (A-F 0-9), like a MAC address.`);
-        }
-
-        config.accessories = config.accessories || [];
-        config.platforms = config.platforms || [];
-        log.info("Loaded config.json with %s accessories and %s platforms.", config.accessories.length, config.platforms.length);
-
-        log.info("---");
-
-        return config;
+        return current;
     }
 
     loadCachedPlatformAccessoriesFromDisk() {
