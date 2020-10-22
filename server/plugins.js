@@ -22,7 +22,7 @@ const Request = require("axios");
 const HBS = require("./instance");
 const Server = require("./server");
 
-const { join, dirname } = require("path");
+const { join } = require("path");
 const { spawn } = require("child_process");
 
 const blocked = [
@@ -121,7 +121,7 @@ module.exports = class Plugins {
                         directory: directory,
                         description: (item.description || "").replace(/(?:https?|ftp):\/\/[\n\S]+/g, "").trim(),
                         keywords: item.keywords || [],
-                        library: dirname(item.main || "./index.js"),
+                        library: item.main || "./index.js",
                         schema: {
                             platform: {
                                 plugin_alias: schema.platform.plugin_alias || schema.platform.pluginAlias,

@@ -99,7 +99,7 @@ module.exports = class Server {
             const filename = join(item.directory, "package.json");
             const identifier = item.scope ? `@${item.scope}/${item.name}` : item.name;
 
-            if (fs.existsSync(filename) && fs.existsSync(join(item.directory, item.library, "index.js"))) {
+            if (fs.existsSync(filename) && fs.existsSync(join(item.directory, item.library))) {
                 let pjson = null;
 
                 try {
