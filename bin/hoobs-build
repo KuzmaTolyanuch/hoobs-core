@@ -186,8 +186,6 @@ case $MODE in
                 ;;
 
     "publish")  if [[ "$DOCKER" = "true" && "$UTILITY" = "false" ]]; then
-                    docker login
-
                     if [[ "$BUILD" = "true" ]]; then
                         npm pack
                         rm -f ./builds/hoobs-core.tgz
