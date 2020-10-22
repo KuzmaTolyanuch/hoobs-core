@@ -149,7 +149,11 @@ module.exports = class Server {
         const current = _.extend({
             server: {},
             client: {},
-            bridge: {},
+            bridge: {
+                name: "HOOBS",
+                pin: "031-45-154",
+                port: 51826
+            },
             description: "",
             ports: {},
             plugins: [],

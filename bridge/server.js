@@ -83,7 +83,7 @@ module.exports = class Server {
             customPluginPath: options.customPluginPath,
         });
 
-        this.bridge = new Bridge(this.config.bridge.name, uuid.generate("HomeBridge"));
+        this.bridge = new Bridge(this.config.bridge.name || "HOOBS", uuid.generate("HomeBridge"));
     }
 
     async start() {
@@ -199,7 +199,11 @@ module.exports = class Server {
         const current = _.extend({
             server: {},
             client: {},
-            bridge: {},
+            bridge: {
+                name: "HOOBS",
+                pin: "031-45-154",
+                port: 51826
+            },
             description: "",
             ports: {},
             plugins: [],

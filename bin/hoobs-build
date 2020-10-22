@@ -199,7 +199,7 @@ case $MODE in
                     read -p "Type \"yes\" to continue: " CONFIRM
 
                     if [[ "$CONFIRM" = "yes" ]]; then
-                        docker buildx build --no-cache --cache-to=type=local,dest=cache,mode=max --platform $ARCH --tag hoobs/hoobs:$TAG .
+                        docker buildx build --cache-to=type=local,dest=cache,mode=max --platform $ARCH --tag hoobs/hoobs:$TAG .
                         docker login
                         docker buildx build --push --cache-from=type=local,src=cache --platform $ARCH --tag hoobs/hoobs:$TAG .
                     fi
