@@ -42,6 +42,15 @@ module.exports = class Server {
             Server.paths.modules.local
         ].concat(options || []);
 
+        if (HBS.docker) {
+            this.arguments.push("-c");
+        }
+
+        if (HBS.name && HBS.name !== "") {
+            this.arguments.push("-i");
+            this.arguments.push(HBS.name);
+        }
+
         this.proc = null;
         this.events = {};
         this.running = false;

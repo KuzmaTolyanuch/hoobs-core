@@ -21,7 +21,8 @@ const HBS = require("../server/instance");
 const { HAPStorage } = require("hap-nodejs");
 const File = require("fs-extra");
 const { User } = require("homebridge/lib/user");
-const Server = require("./server");
+const Bridge = require("./server");
+const Server = require("../server/server");
 const Program = require("commander");
 
 const { dirname, join } = require("path");
@@ -37,6 +38,8 @@ module.exports = () => {
     Program.version(HBS.application.version)
         .allowUnknownOption()
         .option("-d, --debug", "turn on debug level logging", function () { require("./logger").setDebug(true); })
+        .option("-c, --container", "run in container mode", function () { HBS.docker = true; })
+        .option("-i, --instance [name]", "start HOOBS as a named instance", function (name) { HBS.name = name; })
         .option("-p, --plugin-path [path]", "look for plugins installed at [path] as well as the default locations ([path] can also point to a single plugin)", function (p) { customPluginPath = p; })
         .option("-r, --remove-orphans", "remove cached accessories for which plugin is not loaded", function () { keepOrphanedCachedAccessories = true; })
         .option("-u, --user-storage-path [path]", "look for bridge user files at [path]", function (p) { User.setStoragePath(p); })
@@ -44,51 +47,56 @@ module.exports = () => {
 
     HAPStorage.setCustomStoragePath(User.persistPath());
 
-    const server = new Server({
-        keepOrphanedCachedAccessories,
-        insecureAccess: true,
-        hideQRCode: true,
-        customPluginPath
-    });
+    (async () => {
+        HBS.config = await Server.configure();
 
-    const signals = {
-        SIGINT: 2,
-        SIGTERM: 15
-    };
-
-    Object.keys(signals).forEach(function (signal) {
-        process.on(signal, function () {
-            if (terminating) {
-                return;
-            }
-
-            terminating = true;
-
-            internal.info(`Got ${signal}, shutting down Bridge...`);
-
-            server.teardown();
-            server.api.emit("shutdown");
-
-            setTimeout(() => {
-                process.send({ event: "shutdown" });
-                process.exit(128 + signals[signal]);
-            }, 3000)
+        const server = new Bridge({
+            keepOrphanedCachedAccessories,
+            insecureAccess: true,
+            hideQRCode: true,
+            customPluginPath,
+            config: HBS.config
         });
-    });
 
-    process.on("uncaughtException", function (error) {
-        internal.error(error.stack);
-
-        if (!terminating) {
-            process.kill(process.pid, "SIGTERM");
-        }
-    });
-
-    server.start().catch((error) => {
-        internal.error(error.stack);
-
-        if (!terminating) {
-            process.kill(process.pid, "SIGTERM");
-        }
-    });
+        const signals = {
+            SIGINT: 2,
+            SIGTERM: 15
+        };
+    
+        Object.keys(signals).forEach(function (signal) {
+            process.on(signal, function () {
+                if (terminating) {
+                    return;
+                }
+    
+                terminating = true;
+    
+                internal.info(`Got ${signal}, shutting down Bridge...`);
+    
+                server.teardown();
+                server.api.emit("shutdown");
+    
+                setTimeout(() => {
+                    process.send({ event: "shutdown" });
+                    process.exit(128 + signals[signal]);
+                }, 3000)
+            });
+        });
+    
+        process.on("uncaughtException", function (error) {
+            internal.error(error.stack);
+    
+            if (!terminating) {
+                process.kill(process.pid, "SIGTERM");
+            }
+        });
+    
+        server.start().catch((error) => {
+            internal.error(error.stack);
+    
+            if (!terminating) {
+                process.kill(process.pid, "SIGTERM");
+            }
+        });
+    })();
 }

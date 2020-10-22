@@ -67,7 +67,7 @@ module.exports = class Server {
         this.cachedPlatformAccessories = [];
         this.cachedAccessoriesFileCreated = false;
         this.publishedExternalAccessories = new Map();
-        this.config = options.config || Server._loadConfig();
+        this.config = options.config;
         this.keepOrphanedCachedAccessories = options.keepOrphanedCachedAccessories || false;
         this.allowInsecureAccess = true;
         this.externalPorts = this.config.ports;
@@ -193,41 +193,6 @@ module.exports = class Server {
         this.bridge.publish(publishInfo, this.allowInsecureAccess);
 
         process.send({ event: "api_launched" });
-    }
-
-    static _loadConfig() {
-        const current = _.extend({
-            server: {},
-            client: {},
-            bridge: {
-                name: "HOOBS",
-                pin: "031-45-154",
-                port: 51826
-            },
-            description: "",
-            ports: {},
-            plugins: [],
-            accessories: [],
-            platforms: []
-        }, HBS.JSON.load(join(home, "etc", HBS.name || "", "config.json"), {}));
-
-        if (!current.server.port) {
-            current.server.port = 80;
-        }
-
-        if (!current.server.origin) {
-            current.server.origin = "*";
-        }
-
-        if (current.package_manager && current.package_manager === "yarn") {
-            current.package_manager = File.existsSync("/usr/local/bin/yarn") || File.existsSync("/usr/bin/yarn") ? "yarn" : "npm"
-        } else {
-            current.package_manager = "npm";
-        }
-
-        HBS.config = current;
-
-        return current;
     }
 
     loadCachedPlatformAccessoriesFromDisk() {
