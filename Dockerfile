@@ -1,6 +1,10 @@
-FROM node:14.15.1-alpine3.12
+FROM node:14.15.4-buster
 
-RUN apk add --no-cache --virtual .gyp-deps python3 make gcc g++ git avahi-compat-libdns_sd avahi-dev dbus iputils nano ffmpeg
+RUN apt-get -y update && \
+    apt-get -y install --no-install-recommends \
+    python3 make gcc g++ git avahi-daemon dbus nano ffmpeg android-tools-adb android-tools-fastboot \
+  && rm -rf /var/lib/apt/lists/*
+
 RUN chmod 4755 /bin/ping
 RUN mkdir /hoobs
 
